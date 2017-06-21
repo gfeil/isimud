@@ -1,17 +1,24 @@
 require 'spec_helper'
 
 describe Isimud::BunnyClient do
-  before(:each) do
-    @exchange_name = 'isimud_test'
-    @url = 'amqp://guest:guest@localhost'
-  end
-
-  let!(:client) { Isimud::BunnyClient.new(@url) }
-  let!(:connection) { client.connection }
+  let(:exchange_name) { 'isimud_test' }
+  let(:url) { 'amqp://guest:guest@localhost' }
+  let(:client) { Isimud::BunnyClient.new(url) }
+  let(:connection) { client.connection }
 
   describe '#initialize' do
-    it 'sets the broker URL' do
-      expect(client.url).to eq(@url)
+    context 'with a string URL' do
+      it 'sets the broker URL' do
+        expect(client.url).to eq(url)
+      end
+    end
+
+    context 'with a server specified as a hash' do
+      let(:options) { {host: 'foo@example.com', port: 15671, user: 'user', password: 'secret'} }
+      let(:url) { options.stringify_keys }
+      it 'symbolizes the keys and passes the hash' do
+        expect(client.url).to eql(options)
+      end
     end
   end
 
@@ -20,48 +27,52 @@ describe Isimud::BunnyClient do
     let(:proc) { Proc.new { puts('hello') } }
     let(:keys) { %w(foo.bar baz.*) }
     let(:queue_name) { 'my_queue' }
+
     before do
-      Isimud.logger = Logger.new(STDOUT)
+      client.connect
+      @block_called = Array.new
     end
+
     after do
       client.delete_queue(queue_name)
+      client.close
     end
 
-
     it 'creates a new queue' do
-      consumer = client.bind('my_queue', @exchange_name, keys, &proc)
+      consumer = client.bind(queue_name, exchange_name, keys, &proc)
       expect(consumer).to be_a Bunny::Consumer
-      expect(consumer.queue_name).to eq('my_queue')
+      expect(consumer.queue_name).to eq(queue_name)
     end
 
     context 'when a block is passed to the call' do
       it 'binds specified routing keys and subscribes to the specified exchange' do
-        queue = double('queue', name: 'my_queue', bind: 'ok')
-        expect(client).to receive(:find_queue).with('my_queue', durable: true).and_return(queue)
+        queue = double('queue', name: queue_name, bind: 'ok')
+        expect(client).to receive(:find_queue).with(queue_name, durable: true).and_return(queue)
         expect(queue).to receive(:subscribe).with({manual_ack: true})
-        keys.each { |key| expect(queue).to receive(:bind).with(@exchange_name, routing_key: key, nowait: false).once }
-        client.bind('my_queue', @exchange_name, *keys, &proc)
+        keys.each { |key| expect(queue).to receive(:bind).with(exchange_name, routing_key: key, nowait: false).once }
+        client.bind(queue_name, exchange_name, *keys, &proc)
       end
     end
 
     context 'when a block is NOT passed' do
-      it 'binds specified routing keys BUT does not subscribes to the specified exchange' do
-        queue = double('queue', name: 'my_queue', bind: 'ok')
-        expect(client).to receive(:find_queue).with('my_queue', durable: true).and_return(queue)
+      it 'binds specified routing keys BUT does not subscribe to the specified exchange' do
+        queue = double('queue', name: queue_name, bind: 'ok')
+        expect(client).to receive(:find_queue).with(queue_name, durable: true).and_return(queue)
         expect(queue).not_to receive(:subscribe).with(manual_ack: true)
-        keys.each { |key| expect(queue).to receive(:bind).with(@exchange_name, routing_key: key, nowait: false).once }
-        client.bind('my_queue', @exchange_name, *keys)
+        keys.each { |key| expect(queue).to receive(:bind).with(exchange_name, routing_key: key, nowait: false).once }
+        client.bind(queue_name, exchange_name, *keys)
       end
     end
 
     it 'calls block when a message is received' do
-      @block_called = Array.new
-      queue_name    = 'test_queue'
-      client.bind("#{queue_name}", @exchange_name, 'my.test.key') do |payload|
+      client.create_queue(queue_name, exchange_name)
+      client.channel.wait_for_confirms
+      client.bind(queue_name, exchange_name, 'my.test.key') do |payload|
         @block_called << payload
       end
-      client.publish(@exchange_name, 'my.test.key', "Hi there")
-      sleep(1)
+      client.channel.wait_for_confirms
+      client.publish(exchange_name, 'my.test.key', "Hi there")
+      client.channel.wait_for_confirms
       expect(@block_called).to eq ['Hi there']
     end
   end
@@ -112,6 +123,7 @@ describe Isimud::BunnyClient do
 
   describe '#connected?' do
     it 'is true for an open session' do
+      channel = client.connect
       expect(client).to be_connected
     end
 
@@ -134,9 +146,9 @@ describe Isimud::BunnyClient do
     it 'sends the data with the appropriate routing key to the exchange' do
       payload = {a: '123', b: 'this is b'}
       topic   = double(:topic)
-      expect(channel).to receive(:topic).with(@exchange_name, durable: true).and_return(topic)
+      expect(channel).to receive(:topic).with(exchange_name, durable: true).and_return(topic)
       expect(topic).to receive(:publish).with(payload, routing_key: 'foo.bar.baz', persistent: true)
-      client.publish(@exchange_name, 'foo.bar.baz', payload)
+      client.publish(exchange_name, 'foo.bar.baz', payload)
     end
   end
 

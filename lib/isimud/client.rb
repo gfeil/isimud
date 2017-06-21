@@ -39,11 +39,20 @@ module Isimud
 
     # Call each of the exception handlers declared by #on_exception.
     # @param [Exception] exception
+    # @return [Boolean] true if message should be requeued, false otherwise
     def run_exception_handlers(exception)
-      exception_handlers.each{|handler| handler.call(exception)}
+      status = true
+      exception_handlers.each do |handler|
+        status &&= begin
+          handler.call(exception)
+        rescue
+          nil
+        end
+      end
+      Isimud.retry_failures.nil? ? status : Isimud.retry_failures
     end
 
-    def publish(exchange, routing_key, payload)
+    def publish(exchange, routing_key, payload, options)
     end
 
     def reconnect

@@ -17,8 +17,10 @@ module Isimud
     # @see Bunny.new for connection options
     def initialize(_url = nil, _bunny_options = {})
       log "Isimud::BunnyClient.initialize: options = #{_bunny_options.inspect}"
-      @url           = _url || DEFAULT_URL
-      @bunny_options = _bunny_options
+      @url = _url || DEFAULT_URL
+      @url.symbolize_keys! if @url.respond_to?(:symbolize_keys!)
+      @bunny_options = _bunny_options.symbolize_keys
+      @bunny_options[:logger] = Isimud.logger
     end
 
     # Convenience method that finds or creates a named queue, binds to an exchange, and subscribes to messages.
@@ -58,27 +60,32 @@ module Isimud
 
     # Subscribe to messages on the Bunny queue. The provided block will be called each time a message is received.
     #   The message will be acknowledged and deleted from the queue unless an exception is raised from the block.
-    #   In the case that an exception is caught, the message is rejected, and any declared exception handlers will
-    #   be called.
+    #   In the case that an uncaught exception is raised, the message is rejected, and any declared exception handlers
+    #   will be called.
     #
     # @param [Bunny::Queue] queue Bunny queue
-    # @param [Hash] options {manual_ack: true} subscription options -- @see Bunny::Queue#subscribe
+    # @param [Hash] options {} subscription options -- @see Bunny::Queue#subscribe
     # @yieldparam [String] payload message text
-    def subscribe(queue, options = {manual_ack: true}, &block)
-      current_channel = channel
-      queue.subscribe(options) do |delivery_info, properties, payload|
+    def subscribe(queue, options = {}, &block)
+      queue.subscribe(options.merge(manual_ack: true)) do |delivery_info, properties, payload|
+        current_channel = delivery_info.channel
         begin
-          log "Isimud: queue #{queue.name} received #{delivery_info.delivery_tag} routing_key: #{delivery_info.routing_key}"
+          log "Isimud: queue #{queue.name} received #{properties[:message_id]} routing_key: #{delivery_info.routing_key}", :debug
           Thread.current['isimud_queue_name']    = queue.name
           Thread.current['isimud_delivery_info'] = delivery_info
           Thread.current['isimud_properties']    = properties
           block.call(payload)
-          log "Isimud: queue #{queue.name} finished with #{delivery_info.delivery_tag}, acknowledging"
-          current_channel.ack(delivery_info.delivery_tag)
+          if current_channel.open?
+            log "Isimud: queue #{queue.name} finished with #{properties[:message_id]}, acknowledging", :debug
+            current_channel.ack(delivery_info.delivery_tag)
+          else
+            log "Isimud: queue #{queue.name} unable to acknowledge #{properties[:message_id]}", :warn
+          end
         rescue => e
-          log("Isimud: queue #{queue.name} error processing #{delivery_info.delivery_tag} payload #{payload.inspect}: #{e.class.name} #{e.message}\n  #{e.backtrace.join("\n  ")}", :warn)
-          current_channel.reject(delivery_info.delivery_tag, Isimud.retry_failures)
-          run_exception_handlers(e)
+          log("Isimud: queue #{queue.name} error processing #{properties[:message_id]} payload #{payload.inspect}: #{e.class.name} #{e.message}\n  #{e.backtrace.join("\n  ")}", :warn)
+          retry_status = run_exception_handlers(e)
+          log "Isimud: rejecting #{properties[:message_id]} requeue=#{retry_status}", :warn
+          current_channel.open? && current_channel.reject(delivery_info.delivery_tag, retry_status)
         end
       end
     end
@@ -140,9 +147,13 @@ module Isimud
     # @param [String] exchange AMQP exchange name
     # @param [String] routing_key message routing key. This should always be in the form of words separated by dots
     #   e.g. "user.goal.complete"
+    # @param [String] payload message payload
+    # @param [Hash] options additional message options
+    # @see Bunny::Exchange#publish
     # @see http://rubybunny.info/articles/exchanges.html
-    def publish(exchange, routing_key, payload)
-      channel.topic(exchange, durable: true).publish(payload, routing_key: routing_key, persistent: true)
+    def publish(exchange, routing_key, payload, options = {})
+      log "Isimud::BunnyClient#publish: exchange=#{exchange} routing_key=#{routing_key}", :debug
+      channel.topic(exchange, durable: true).publish(payload, options.merge(routing_key: routing_key, persistent: true))
     end
 
     # Close and reopen the AMQP connection
